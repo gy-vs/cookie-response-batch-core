@@ -10,6 +10,9 @@
  *   persisted lastAccess with the unflushed watermark.
  * - Optimistic document revision (CAS) prevents a concurrent commit from
  *   evicting or overwriting an item another writer just updated.
+ * - Whole-response receive: all Set-Cookie fields of one HTTP response are
+ *   parsed against the request URL and committed as a single atomic
+ *   operation with per-field diagnostics.
  */
 
 /** Public cookie shape, as accepted by {@link CookieJar.set}. */
@@ -77,6 +80,79 @@ export interface SetResult {
   /** Access-watermark entries folded into this commit. */
   accessesFlushed: number;
   /** Document revision after the commit. */
+  rev: number;
+}
+
+/** Why a single Set-Cookie field was rejected by {@link CookieJar.receiveSetCookies}. */
+export type SetCookieRejectReason =
+  /** No "=" in the name-value pair. */
+  | 'missing-pair'
+  /** Empty cookie name. */
+  | 'empty-name'
+  /** Name contains a CTL, whitespace, or a separator character. */
+  | 'invalid-name'
+  /** Value contains a control character. */
+  | 'invalid-value'
+  /** Domain attribute does not domain-match the request URL host. */
+  | 'domain-mismatch'
+  /** "name=value" exceeds the jar's maxCookieBytes cap. */
+  | 'oversize';
+
+/** What an accepted Set-Cookie field did in the final committed document. */
+export type SetCookieDisposition =
+  /** The cookie was written (inserted or replaced). */
+  | 'stored'
+  /** The field carried an already-expired date and deleted its identity. */
+  | 'removed';
+
+/** Per-field outcome of {@link CookieJar.receiveSetCookies}, in response order. */
+export interface ReceivedSetCookie {
+  /** Position of the raw field in the input. */
+  index: number;
+  /** The raw Set-Cookie field value, as received. */
+  field: string;
+  /** Whether the field was parsed and applied by the receive operation. */
+  accepted: boolean;
+  /** Parsed cookie name (accepted fields only). */
+  name?: string;
+  /** Canonical cookie domain derived from the request URL (accepted only). */
+  domain?: string;
+  /** Cookie path: the Path attribute or the request URL's default path. */
+  path?: string;
+  /** Canonical identity key (accepted fields only). */
+  key?: string;
+  /**
+   * Final effect of this field in the committed document. Reported from the
+   * winning plan, so it always describes the same commit as {@link ReceiveResult.rev}.
+   */
+  disposition?: SetCookieDisposition;
+  /**
+   * Index of the later accepted field with the same identity that overrode
+   * this one within the same response. Absent on the effective (last) field.
+   */
+  supersededBy?: number;
+  /** Why the field was rejected (rejected fields only). */
+  reason?: SetCookieRejectReason;
+}
+
+/** Return value of {@link CookieJar.receiveSetCookies}. */
+export interface ReceiveResult {
+  /** Per-field outcomes, aligned with the input order. */
+  fields: ReceivedSetCookie[];
+  /** How many fields were accepted into the receive operation. */
+  accepted: number;
+  /** How many fields were rejected (never entered the jar). */
+  rejected: number;
+  /** Keys of expired cookies purged during the commit. */
+  expired: string[];
+  /** Keys evicted to satisfy quotas during the commit. */
+  evicted: string[];
+  /** Access-watermark entries folded into this commit. */
+  accessesFlushed: number;
+  /**
+   * Document revision after the commit. When no field was acceptable the jar
+   * is left untouched and this is the last observed revision.
+   */
   rev: number;
 }
 
@@ -157,12 +233,193 @@ export function cookieBytes(c: Pick<Cookie, 'name' | 'value'>): number {
   return new TextEncoder().encode(`${c.name}=${c.value}`).length;
 }
 
+/**
+ * A validated cookie write, planned against one loaded document. Whether it
+ * stores or deletes is decided at plan time (expires vs. the plan clock), so
+ * a retried plan re-evaluates the decision against the fresh state.
+ */
+interface PlannedCookie {
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+  secure: boolean;
+  created: number;
+  expires?: number;
+  priority: 'low' | 'medium' | 'high';
+}
+
 interface Plan {
   doc: CookieDocument;
   expired: string[];
   evicted: string[];
   accessesFlushed: number;
-  stored: boolean;
+  /** Per-op effect ('stored' | 'removed'), aligned with the input ops. */
+  outcomes: SetCookieDisposition[];
+}
+
+/* ------------------------------------------------------------------ *
+ * Set-Cookie field parsing (RFC 6265 §5.1–§5.3, pragmatic subset).
+ * ------------------------------------------------------------------ */
+
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+
+/**
+ * HTTP cookie-date parser (RFC 6265 §5.1.1). Tolerates the historical date
+ * formats by scanning delimiter-separated tokens for time, day, month, year.
+ * Returns ms epoch, or undefined when no valid calendar date is present.
+ */
+function parseCookieDate(value: string): number | undefined {
+  const tokens = value.split(/[\t\x20-\x2f\x3b-\x40\x5b-\x60\x7b-\x7e]+/);
+  let hour = -1;
+  let minute = -1;
+  let second = -1;
+  let day = -1;
+  let month = -1;
+  let year = -1;
+  for (const tok of tokens) {
+    let m: RegExpExecArray | null;
+    if (second < 0 && (m = /^(\d{1,2}):(\d{1,2}):(\d{1,2})(?:\D.*)?$/.exec(tok))) {
+      hour = +m[1];
+      minute = +m[2];
+      second = +m[3];
+    } else if (day < 0 && (m = /^(\d{1,2})(?:\D.*)?$/.exec(tok))) {
+      day = +m[1];
+    } else if (month < 0 && (m = /^([a-zA-Z]{3})/.exec(tok))) {
+      const i = MONTHS.indexOf(m[1].toLowerCase());
+      if (i >= 0) month = i;
+    } else if (year < 0 && (m = /^(\d{2,4})(?:\D.*)?$/.exec(tok))) {
+      year = +m[1];
+    }
+  }
+  if (year >= 70 && year <= 99) year += 1900;
+  else if (year >= 0 && year <= 69) year += 2000;
+  if (
+    second < 0 ||
+    day < 1 ||
+    day > 31 ||
+    month < 0 ||
+    year < 1601 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    return undefined;
+  }
+  return Date.UTC(year, month, day, hour, minute, second);
+}
+
+/** Default cookie path for a request URL path (RFC 6265 §5.1.4). */
+function defaultCookiePath(urlPath: string): string {
+  if (!urlPath.startsWith('/')) return '/';
+  const lastSlash = urlPath.lastIndexOf('/');
+  if (lastSlash === 0) return '/';
+  return urlPath.slice(0, lastSlash);
+}
+
+/**
+ * Parse one raw Set-Cookie field in the context of the request URL that
+ * produced it. Domain and path are always resolved against that URL — the
+ * caller cannot inject a precomputed identity — so an accepted cookie is
+ * exactly one the jar's own get() matching rules would return for this
+ * origin. Attribute duplicates: the first occurrence wins; Max-Age takes
+ * precedence over Expires; unknown attributes (HttpOnly, SameSite, …) are
+ * parsed and ignored.
+ */
+function parseSetCookieField(
+  field: string,
+  host: string,
+  urlPath: string,
+  now: number,
+  maxCookieBytes: number,
+): { ok: true; cookie: PlannedCookie } | { ok: false; reason: SetCookieRejectReason } {
+  const semi = field.indexOf(';');
+  const pairStr = semi < 0 ? field : field.slice(0, semi);
+  const attrStr = semi < 0 ? '' : field.slice(semi + 1);
+
+  const eq = pairStr.indexOf('=');
+  if (eq < 0) return { ok: false, reason: 'missing-pair' };
+  const name = pairStr.slice(0, eq).trim();
+  let value = pairStr.slice(eq + 1).trim();
+  if (name === '') return { ok: false, reason: 'empty-name' };
+  // Name must be a token: no CTLs, whitespace, or separators.
+  if (/[\x00-\x20\x7f()<>@,;:\\"/\[\]?={}]/.test(name)) return { ok: false, reason: 'invalid-name' };
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    value = value.slice(1, -1);
+  }
+  if (/[\x00-\x1f\x7f]/.test(value)) return { ok: false, reason: 'invalid-value' };
+
+  let expiresAt: number | undefined;
+  let maxAge: number | undefined;
+  let domainAttr: string | undefined;
+  let pathAttr: string | undefined;
+  let secure = false;
+  const seen = new Set<string>();
+  for (const raw of attrStr.split(';')) {
+    const av = raw.trim();
+    if (av === '') continue;
+    const aeq = av.indexOf('=');
+    const an = (aeq < 0 ? av : av.slice(0, aeq)).trim().toLowerCase();
+    const avv = aeq < 0 ? '' : av.slice(aeq + 1).trim();
+    if (seen.has(an)) continue;
+    seen.add(an);
+    switch (an) {
+      case 'expires': {
+        const t = parseCookieDate(avv);
+        if (t !== undefined) expiresAt = t; // unparseable date: attribute ignored
+        break;
+      }
+      case 'max-age': {
+        if (/^-?\d+$/.test(avv)) maxAge = parseInt(avv, 10);
+        break;
+      }
+      case 'domain': {
+        const d = (avv.startsWith('.') ? avv.slice(1) : avv).toLowerCase();
+        if (d !== '') domainAttr = d;
+        break;
+      }
+      case 'path': {
+        if (avv.startsWith('/')) pathAttr = avv; // otherwise: default path
+        break;
+      }
+      case 'secure':
+        secure = true;
+        break;
+      default:
+        break; // httponly, samesite, extensions: no jar-level effect
+    }
+  }
+
+  let expires: number | undefined;
+  if (maxAge !== undefined) expires = now + maxAge * 1000;
+  else if (expiresAt !== undefined) expires = expiresAt;
+
+  // The Domain attribute must domain-match the request host, mirroring the
+  // jar's get() rule (exact host or parent suffix). IP hosts match exactly.
+  let domain: string;
+  if (domainAttr !== undefined) {
+    const isIp = host.includes(':') || /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+    const matches = isIp
+      ? host === domainAttr
+      : host === domainAttr || host.endsWith('.' + domainAttr);
+    if (!matches) return { ok: false, reason: 'domain-mismatch' };
+    domain = domainAttr;
+  } else {
+    domain = host;
+  }
+
+  const cookie: PlannedCookie = {
+    name,
+    value,
+    domain,
+    path: pathAttr ?? defaultCookiePath(urlPath),
+    secure,
+    created: now,
+    expires,
+    priority: 'medium',
+  };
+  if (cookieBytes(cookie) > maxCookieBytes) return { ok: false, reason: 'oversize' };
+  return { ok: true, cookie };
 }
 
 /**
@@ -275,33 +532,113 @@ export class CookieJar {
       return { stored: false, oversize: true, expired: [], evicted: [], accessesFlushed: 0, rev: this.#version };
     }
 
-    const domain = cookie.domain.toLowerCase();
     const priority: StoredCookie['priority'] = cookie.priority ?? 'medium';
     if (!(priority in PRIORITY_RANK)) throw new TypeError(`invalid priority: ${String(cookie.priority)}`);
-    const created = cookie.created ?? this.#now();
 
-    for (;;) {
-      const doc = await this.#store.load();
-      const pending = new Map(this.#pending);
-      const plan = this.#plan(doc, pending, cookie, domain, priority, created);
-      try {
-        const { doc: committed } = await this.#store.commit(plan.doc, doc.version);
-        this.#version = committed.version;
-        this.#reconcile(committed);
-        return {
-          stored: plan.stored,
-          oversize: false,
-          expired: plan.expired,
-          evicted: plan.evicted,
-          accessesFlushed: plan.accessesFlushed,
-          rev: committed.version,
-        };
-      } catch (e) {
-        if (!(e instanceof RevisionConflict)) throw e;
-        // Another writer landed first: reload and rebuild against the fresh
-        // state, so its just-updated item is never evicted by our stale plan.
+    const op: PlannedCookie = {
+      name: cookie.name,
+      value: cookie.value,
+      domain: cookie.domain.toLowerCase(),
+      path: cookie.path,
+      secure: cookie.secure,
+      created: cookie.created ?? this.#now(),
+      expires: cookie.expires,
+      priority,
+    };
+    const { committed, plan } = await this.#commitOps([op]);
+    return {
+      stored: plan.outcomes[0] === 'stored',
+      oversize: false,
+      expired: plan.expired,
+      evicted: plan.evicted,
+      accessesFlushed: plan.accessesFlushed,
+      rev: committed.version,
+    };
+  }
+
+  /**
+   * Receive the Set-Cookie fields of one HTTP response as a single atomic
+   * operation. `requestUrl` is the URL that produced the response; every
+   * field's domain and path are resolved against it (Domain attribute must
+   * domain-match the request host, missing Path defaults from the URL path),
+   * so the receive context cannot be bypassed with precomputed identities.
+   *
+   * Fields are validated independently — one invalid field never discards
+   * the valid ones — and applied in response order, so repeated writes and
+   * deletions of the same identity settle to the last field's effect.
+   * All accepted fields land in one CAS-protected commit together with the
+   * pending access watermark; on a revision conflict the whole response is
+   * re-planned against the fresh document, never just the last field. The
+   * returned per-field records, expired/evicted lists and revision all
+   * describe that single final commit. A response with no acceptable field
+   * leaves the jar untouched.
+   */
+  async receiveSetCookies(
+    requestUrl: string | URL,
+    setCookieFields: string | readonly string[],
+  ): Promise<ReceiveResult> {
+    const url = toUrl(requestUrl);
+    const host = url.hostname.toLowerCase();
+    if (host === '') throw new TypeError('request URL must have a host');
+    const fields = typeof setCookieFields === 'string' ? [setCookieFields] : setCookieFields;
+    const now = this.#now();
+
+    const records: ReceivedSetCookie[] = [];
+    const ops: PlannedCookie[] = [];
+    const acceptedAt: number[] = []; // ops index -> records index
+    for (let i = 0; i < fields.length; i++) {
+      const field = fields[i];
+      if (typeof field !== 'string') throw new TypeError('Set-Cookie fields must be strings');
+      const parsed = parseSetCookieField(field, host, url.pathname, now, this.#maxCookieBytes);
+      const rec: ReceivedSetCookie = { index: i, field, accepted: parsed.ok };
+      if (parsed.ok) {
+        rec.name = parsed.cookie.name;
+        rec.domain = parsed.cookie.domain;
+        rec.path = parsed.cookie.path;
+        rec.key = cookieKey(parsed.cookie.domain, parsed.cookie.path, parsed.cookie.name);
+        acceptedAt.push(i);
+        ops.push(parsed.cookie);
+      } else {
+        rec.reason = parsed.reason;
       }
+      records.push(rec);
     }
+
+    // Repeated identities: the last accepted field is the effective one.
+    const lastByKey = new Map<string, number>();
+    for (const i of acceptedAt) lastByKey.set(records[i].key!, i);
+    for (const i of acceptedAt) {
+      const last = lastByKey.get(records[i].key!)!;
+      if (last !== i) records[i].supersededBy = last;
+    }
+
+    const rejected = records.length - ops.length;
+    if (ops.length === 0) {
+      // Nothing acceptable: no commit, watermark and document untouched.
+      return {
+        fields: records,
+        accepted: 0,
+        rejected,
+        expired: [],
+        evicted: [],
+        accessesFlushed: 0,
+        rev: this.#version,
+      };
+    }
+
+    const { committed, plan } = await this.#commitOps(ops);
+    for (let j = 0; j < acceptedAt.length; j++) {
+      records[acceptedAt[j]].disposition = plan.outcomes[j];
+    }
+    return {
+      fields: records,
+      accepted: ops.length,
+      rejected,
+      expired: plan.expired,
+      evicted: plan.evicted,
+      accessesFlushed: plan.accessesFlushed,
+      rev: committed.version,
+    };
   }
 
   /**
@@ -364,7 +701,7 @@ export class CookieJar {
       if (this.#pending.size === 0) return 0;
       const doc = await this.#store.load();
       const pending = new Map(this.#pending);
-      const plan = this.#plan(doc, pending, null);
+      const plan = this.#plan(doc, pending, []);
       try {
         const { doc: committed } = await this.#store.commit(plan.doc, doc.version);
         this.#version = committed.version;
@@ -385,86 +722,103 @@ export class CookieJar {
   }
 
   /**
-   * Build the next document snapshot. All mutation paths (set, flush) funnel
-   * through here so expiry purge, watermark merge and quota eviction use one
-   * consistent, deterministic procedure.
+   * Plan `ops` against the current document and commit the result in one
+   * CAS-protected write. A revision conflict reloads and re-plans the whole
+   * operation list against the fresh state, so the committed document and
+   * the returned plan always describe the same final commit.
    */
-  #plan(
-    doc: CookieDocument,
-    pending: Map<string, number>,
-    incoming: Cookie | null,
-    domain?: string,
-    priority?: StoredCookie['priority'],
-    created?: number,
-  ): Plan {
+  async #commitOps(ops: readonly PlannedCookie[]): Promise<{ committed: CookieDocument; plan: Plan }> {
+    for (;;) {
+      const doc = await this.#store.load();
+      const pending = new Map(this.#pending);
+      const plan = this.#plan(doc, pending, ops);
+      try {
+        const { doc: committed } = await this.#store.commit(plan.doc, doc.version);
+        this.#version = committed.version;
+        this.#reconcile(committed);
+        return { committed, plan };
+      } catch (e) {
+        if (!(e instanceof RevisionConflict)) throw e;
+        // Another writer landed first: reload and rebuild against the fresh
+        // state, so its just-updated item is never evicted by our stale plan.
+      }
+    }
+  }
+
+  /**
+   * Build the next document snapshot. All mutation paths (set, receive,
+   * flush) funnel through here so expiry purge, watermark merge and quota
+   * eviction use one consistent, deterministic procedure. Ops are applied
+   * in the given order; an op whose expiry has already passed deletes its
+   * identity instead of storing.
+   */
+  #plan(doc: CookieDocument, pending: Map<string, number>, ops: readonly PlannedCookie[]): Plan {
     const now = this.#now();
-    let evicted: string[] = [];
+    const evicted: string[] = [];
     const expired: string[] = [];
+    let accessesFlushed = 0;
+    const outcomes: SetCookieDisposition[] = [];
 
     // 1. Purge expired cookies (also clears simultaneous expiries).
     const live: StoredCookie[] = [];
     for (const c of doc.cookies) {
+      const k = cookieKey(c.domain, c.path, c.name);
       if (c.expires !== undefined && c.expires <= now) {
-        expired.push(cookieKey(c.domain, c.path, c.name));
-        pending.delete(cookieKey(c.domain, c.path, c.name));
+        expired.push(k);
+        pending.delete(k);
       } else {
         live.push({ ...c });
       }
     }
 
-    // An already-expired incoming cookie deletes its key instead of storing.
-    let stored = false;
-    if (incoming && domain !== undefined && priority !== undefined && created !== undefined) {
-      const inKey = cookieKey(domain, incoming.path, incoming.name);
-      if (incoming.expires !== undefined && incoming.expires <= now) {
-        for (let i = 0; i < live.length; i++) {
-          const c = live[i];
-          if (cookieKey(c.domain, c.path, c.name) === inKey) {
-            expired.push(inKey);
-            live.splice(i, 1);
-            pending.delete(inKey);
-            break;
-          }
+    // 2. Apply the planned ops in order. Keys written by this batch are
+    //    tracked so a delete only reports genuinely persisted removals and
+    //    a same-batch rewrite does not bump the per-cookie revision twice.
+    const storedThisBatch = new Set<string>();
+    for (const op of ops) {
+      const k = cookieKey(op.domain, op.path, op.name);
+      if (op.expires !== undefined && op.expires <= now) {
+        // Already-expired op: delete the identity instead of storing.
+        outcomes.push('removed');
+        const i = live.findIndex((c) => cookieKey(c.domain, c.path, c.name) === k);
+        if (i >= 0) {
+          live.splice(i, 1);
+          if (!storedThisBatch.has(k)) expired.push(k);
+          storedThisBatch.delete(k);
         }
-      } else {
-        // 2. Merge the unflushed watermark into lastAccess; insert/replace.
-        let accessesFlushed = 0;
-        let replaced = false;
-        for (const c of live) {
-          const k = cookieKey(c.domain, c.path, c.name);
-          const t = pending.get(k);
-          if (t !== undefined) {
-            if (t > c.lastAccess) c.lastAccess = t;
-            accessesFlushed++;
-          }
-          if (k === inKey) {
-            replaced = true;
-            c.value = incoming.value;
-            c.secure = incoming.secure;
-            c.expires = incoming.expires;
-            c.priority = priority;
-            c.created = created;
-            c.lastAccess = created;
-            c.rev += 1; // revision bumps on overwrite
-          }
-        }
-        if (!replaced) {
-          live.push({
-            ...incoming,
-            domain,
-            priority,
-            created,
-            lastAccess: created,
-            rev: 1,
-          });
-        }
-        pending.delete(inKey);
-        return this.#finish(live, pending, doc.version, expired, evicted, accessesFlushed, true);
+        pending.delete(k);
+        continue;
       }
+      outcomes.push('stored');
+      // A pending access for the written key is discarded into this commit.
+      if (pending.delete(k)) accessesFlushed++;
+      const existing = live.find((c) => cookieKey(c.domain, c.path, c.name) === k);
+      if (existing) {
+        existing.value = op.value;
+        existing.secure = op.secure;
+        existing.expires = op.expires;
+        existing.priority = op.priority;
+        existing.created = op.created;
+        existing.lastAccess = op.created;
+        if (!storedThisBatch.has(k)) existing.rev += 1; // revision bumps on overwrite
+      } else {
+        live.push({
+          name: op.name,
+          value: op.value,
+          domain: op.domain,
+          path: op.path,
+          secure: op.secure,
+          created: op.created,
+          expires: op.expires,
+          priority: op.priority,
+          lastAccess: op.created,
+          rev: 1,
+        });
+      }
+      storedThisBatch.add(k);
     }
 
-    // 3. Flush path (or set of an expired cookie): fold the watermark.
-    let accessesFlushed = 0;
+    // 3. Fold the remaining unflushed watermark into lastAccess.
     for (const c of live) {
       const k = cookieKey(c.domain, c.path, c.name);
       const t = pending.get(k);
@@ -473,7 +827,8 @@ export class CookieJar {
         accessesFlushed++;
       }
     }
-    return this.#finish(live, pending, doc.version, expired, evicted, accessesFlushed, stored);
+
+    return this.#finish(live, pending, doc.version, expired, evicted, accessesFlushed, outcomes);
   }
 
   /** Enforce quotas and canonicalize the snapshot. */
@@ -484,7 +839,7 @@ export class CookieJar {
     expired: string[],
     evicted: string[],
     accessesFlushed: number,
-    stored: boolean,
+    outcomes: SetCookieDisposition[],
   ): Plan {
     // 4. Per-domain quota. Normally only the incoming domain can newly
     //    exceed; all offending domains are handled deterministically in a
@@ -535,15 +890,20 @@ export class CookieJar {
       const kb = cookieKey(b.domain, b.path, b.name);
       return ka < kb ? -1 : ka > kb ? 1 : 0;
     });
-    expired.sort();
+
+    // A key re-stored after an in-batch purge/delete is not "gone": expired
+    // lists only identities absent from the final committed document.
+    const finalKeys = new Set(live.map((c) => cookieKey(c.domain, c.path, c.name)));
+    const gone = expired.filter((k) => !finalKeys.has(k));
+    gone.sort();
     evicted.sort();
 
     return {
       doc: { version: version + 1, cookies: live },
-      expired,
+      expired: gone,
       evicted,
       accessesFlushed,
-      stored,
+      outcomes,
     };
   }
 
@@ -566,4 +926,13 @@ function positive(v: number | undefined, d: number): number {
   if (v === undefined) return d;
   if (!Number.isInteger(v) || v < 1) throw new RangeError('quota values must be positive integers');
   return v;
+}
+
+function toUrl(u: string | URL): URL {
+  if (u instanceof URL) return u;
+  try {
+    return new URL(u);
+  } catch {
+    throw new TypeError(`invalid request URL: ${u}`);
+  }
 }
